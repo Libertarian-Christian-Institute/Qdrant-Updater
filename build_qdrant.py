@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 from langchain_openai import AzureOpenAIEmbeddings
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
+from qdrant_client.models import PointStruct, VectorParams, Distance, PointIdsList
 from qdrant_client.http.exceptions import UnexpectedResponse
 from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -48,19 +48,25 @@ def update_qdrant():
         )
         for _, row in posts_df.iterrows()
     ]
-    for doc in documents:
-        print("Page Conent", doc.page_content)
-        print("Metadata", doc.metadata)
-        print("Author", doc.metadata["author"])
 
 
     # ---------------------- Text Split -----------------------
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=300)
     splits = text_splitter.split_documents(documents)
-    splits_id = [str(uuid.uuid4()) for _ in splits]
 
-    texts = [doc.page_content for doc in splits]
-    metadatas = [doc.metadata for doc in splits]
+    # Deterministic IDs: the same chunk of the same article always maps to the same point,
+    # so re-running upserts in place instead of adding another copy of every article.
+    seen = set()
+    texts, metadatas, splits_id = [], [], []
+    for doc in splits:
+        pid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{doc.metadata['link']}\n{doc.page_content}"))
+        if pid in seen:
+            continue
+        seen.add(pid)
+        texts.append(doc.page_content)
+        metadatas.append(doc.metadata)
+        splits_id.append(pid)
+    print(f"{len(documents)} articles -> {len(texts)} unique chunks")
 
     # -------------------- Qdrant Setup -----------------------
     # Same connection settings as LCI-Chatbot (services/vector.py); the server requires an API key.
@@ -75,6 +81,23 @@ def update_qdrant():
             vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
 
         )
+
+    def all_point_ids(client, collection_name):
+        ids, offset = set(), None
+        while True:
+            points, offset = client.scroll(collection_name=collection_name, limit=1000, offset=offset,
+                                           with_payload=False, with_vectors=False)
+            ids.update(str(p.id) for p in points)
+            if offset is None:
+                return ids
+
+    existing_ids = all_point_ids(qdrant_client, collection_name)
+    current_ids = set(splits_id)
+    todo = [i for i, pid in enumerate(splits_id) if pid not in existing_ids]
+    print(f"Qdrant has {len(existing_ids)} points; {len(texts) - len(todo)} chunks already present, {len(todo)} to embed")
+    texts = [texts[i] for i in todo]
+    metadatas = [metadatas[i] for i in todo]
+    splits_id = [splits_id[i] for i in todo]
 
 
     # ------------------- Rate Limiting Utils -------------------
@@ -130,3 +153,16 @@ def update_qdrant():
                     sleep_pbar.update(1)
 
     p_bar.close()
+
+    # ------------------- Prune stale / duplicate points -------------------
+    # Runs only after every current chunk is uploaded, so the collection is never left empty.
+    # Removes old random-ID duplicates and chunks of articles that were edited or deleted.
+    min_chunks = int(os.getenv("PRUNE_MIN_CHUNKS", 1000))
+    if len(current_ids) < min_chunks:
+        print(f"Skipping prune: only {len(current_ids)} current chunks (< {min_chunks}); posts.csv may be incomplete")
+        return
+    stale = [pid for pid in all_point_ids(qdrant_client, collection_name) if pid not in current_ids]
+    for i in range(0, len(stale), 1000):
+        qdrant_client.delete(collection_name=collection_name,
+                             points_selector=PointIdsList(points=stale[i:i + 1000]))
+    print(f"Pruned {len(stale)} stale/duplicate points; collection now holds {len(current_ids)} chunks")
